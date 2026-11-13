@@ -1,0 +1,6 @@
+.env
+tls/
+data/
+logs/
+mosquitto/passwords
+node_modules/

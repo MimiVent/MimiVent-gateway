@@ -1,0 +1,16 @@
+{
+  "name": "mimivent-nas-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:integration": "node --test test/query.integration.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.22.2 <23"
+  },
+  "dependencies": {
+    "mqtt": "5.16.1",
+    "qrcode": "1.5.4"
+  }
+}

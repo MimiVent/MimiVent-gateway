@@ -1,0 +1,54 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0.22
+    container_name: mimivent-mosquitto
+    restart: unless-stopped
+    ports:
+      - "${NAS_IP:?set NAS_IP in .env}:1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto/acl:/mosquitto/config/acl:ro
+      - ./mosquitto/passwords:/mosquitto/config/passwords:ro
+      - ./data/mosquitto:/mosquitto/data
+      - ./logs/mosquitto:/mosquitto/log
+    networks:
+      - mimivent
+
+  gateway:
+    image: mimivent-gateway:0.1.0
+    build:
+      context: .
+    container_name: mimivent-gateway
+    restart: unless-stopped
+    user: "${GATEWAY_UID:-1000}:${GATEWAY_GID:-1000}"
+    depends_on:
+      - mosquitto
+    environment:
+      PORT: "8444"
+      HTTP_SETUP_PORT: "18080"
+      NAS_IP: ${NAS_IP:?set NAS_IP in .env}
+      MQTT_EXTERNAL_PORT: "1883"
+      MQTT_URL: mqtt://mosquitto:1883
+      MQTT_USERNAME: ${MQTT_USERNAME:?set MQTT_USERNAME in .env}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:?set MQTT_PASSWORD in .env}
+      TLS_CERT_FILE: /run/tls/cert.pem
+      TLS_KEY_FILE: /run/tls/key.pem
+      GATEWAY_DATA_DIR: /app/data
+      ACK_TIMEOUT_MS: "6000"
+      TIME_SYNC_HEALTH_FILE: /run/mimivent/time-health.json
+    ports:
+      - "${NAS_IP:?set NAS_IP in .env}:8444:8444"
+      - "${NAS_IP:?set NAS_IP in .env}:18080:18080"
+    volumes:
+      - ./tls:/run/tls:ro
+      # NAS 使用已导入镜像时直接挂载受版本控制的网关源码，避免运行旧镜像内的 server.mjs。
+      - ./server.mjs:/app/server.mjs:ro
+      - ./data/gateway:/app/data
+      # NAS 主机侧健康提供器原子更新该文件；无文件/陈旧文件时校时安全失败关闭。
+      - ${HOST_TIME_SYNC_HEALTH_DIR:-./data/time-health}:/run/mimivent:ro
+    networks:
+      - mimivent
+
+networks:
+  mimivent:
+    name: mimivent

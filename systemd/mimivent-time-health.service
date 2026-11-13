@@ -1,0 +1,21 @@
+[Unit]
+Description=MimiVent NAS host time-health provider
+Wants=network-online.target systemd-timesyncd.service
+After=network-online.target systemd-timesyncd.service
+RequiresMountsFor=/vol1/1000/docker/mimivent/data/time-health
+
+[Service]
+Type=simple
+User=admin
+Group=Users
+WorkingDirectory=/vol1/1000/docker/mimivent
+ExecStart=/usr/bin/python3 /vol1/1000/docker/mimivent/time_health_provider.py /vol1/1000/docker/mimivent/data/time-health/time-health.json --watch --interval-seconds 10
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/vol1/1000/docker/mimivent/data/time-health
+
+[Install]
+WantedBy=multi-user.target
