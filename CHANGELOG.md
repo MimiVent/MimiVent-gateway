@@ -7,11 +7,12 @@
 - 中断配置可用原会话令牌续期；保留未完成事务所需的服务凭据，允许在已激活/已核验阶段补存同一凭据后恢复。
 - 手机凭据管理：`GET/POST /api/v1/devices/:id/phones`、`DELETE .../phones/:phoneId`；每台设备最多 32 部手机（代码固定上限）；最后一部手机不能自撤。
 - 手机权限不再区分管理员：所有已加入手机均可查看成员、生成邀请并撤销成员；升级时把旧管理员角色归一为普通成员。
-- 访问鉴权：Bearer 改为 Gateway 签发的手机凭据（`X-Phone-Id`，兼容旧 `X-Device-Token-Id`）；控制时服务 token 由 Gateway 从数据库读取，不再由手机携带。
+- 访问鉴权：Bearer 改为 Gateway 签发的手机凭据，并使用 `X-App-Instance-Id` 标识当前 App 实例；控制时服务 token 由 Gateway 从数据库读取，不再由手机携带。
 - 保留旧模型兼容：手机凭据表无匹配时仍接受设备绑定 token，已有 NAS 配置继续工作。
 - 修复：`GET /api/v1/devices` 对无效凭据返回 401（此前返回空列表 200）；`phoneId` 与 token 必须匹配同一设备，禁止跨设备混用凭据。
 - 配置恢复：会话令牌有效性不依赖原 24 小时 TTL；中断后可续期恢复，保留未完成事务所需的候选服务凭据。
 - 验证：Gateway 集成测试 17/17 通过；NAS 部署后续期路由、HTTPS 配置页和 HTTP 首配页已确认可用。
+- 发布附带 `linux/amd64` Docker 镜像归档，供 x86-64 NAS 离线导入；ARM64 用户可从源码构建对应架构镜像。
 
 ## MimiVent NAS Gateway v0.1.0（2026-11-13）
 

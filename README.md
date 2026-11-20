@@ -179,7 +179,21 @@ python3 time_health_provider.py data/time-health/time-health.json --watch --inte
 - NAS 或 Broker 停机时，App 明确提示网关不可用并允许用户切换蓝牙；设备 HTTPS 控制已关闭，不执行直连回退。等待设备 ACK 超时则保留原 requestId，App 查询原结果，不自动重发。
 - Broker 用户认证与 ACL 不能替代设备服务授权校验。每设备一份服务授权；手机成员授权由 Gateway 单独验证和撤销。
 
-### Docker 仓库不可达时：跨架构镜像传入 NAS
+### 下载 Gateway 镜像或自行构建
+
+GitHub Release 附带 `mimivent-gateway-0.2.0-linux-amd64.tar.gz`，对应飞牛等 x86-64 NAS，镜像标签是 `mimivent-gateway:0.2.0`。在电脑下载后传到 NAS，再加载镜像：
+
+```sh
+scp mimivent-gateway-0.2.0-linux-amd64.tar.gz admin@NAS_IP:/tmp/
+ssh admin@NAS_IP 'gzip -dc /tmp/mimivent-gateway-0.2.0-linux-amd64.tar.gz | sudo docker load'
+cd /vol1/1000/docker/mimivent
+sudo docker compose -f compose.yaml up -d gateway
+sudo docker compose -f compose.yaml ps
+```
+
+加载后不要加 `--build`，否则 Compose 会尝试重新构建镜像。ARM64 NAS 请从源码在 NAS 上构建，或在电脑使用 `--platform linux/arm64` 构建；不要使用上面的 amd64 镜像。
+
+### Docker 仓库不可达时：自行构建跨架构镜像
 
 以下示例假定 NAS SSH 用户为 `admin`，将 `NAS_IP` 替换为 NAS 固定地址。`--platform linux/amd64` 必须保留，因为飞牛 NAS 通常是 x86-64；不要把 Mac 本机 arm64 镜像直接传给 NAS。
 
@@ -204,7 +218,7 @@ sudo docker compose -f compose.yaml ps
 
 ## 运维
 
-App 可通过 `GET /api/v1/devices/{deviceId}/requests/{requestId}` 查询网关缓存的 `pending/applied/rejected`。必须使用发起该请求手机的原始 bearer 凭据和 `X-Phone-Id`；其他手机不能查询该手机的请求。接口只读取结果，不发布 MQTT 命令；缓存默认保留 10 分钟，网关重启后或没有记录时返回 404，App 再查设备持久化记录。
+App 可通过 `GET /api/v1/devices/{deviceId}/requests/{requestId}` 查询网关缓存的 `pending/applied/rejected`。必须使用发起该请求手机的原始 bearer 凭据和 `X-App-Instance-Id`；其他手机不能查询该手机的请求。接口只读取结果，不发布 MQTT 命令；缓存默认保留 10 分钟，网关重启后或没有记录时返回 404，App 再查设备持久化记录。
 
 最新设备状态保存在 Gateway 的 SQLite 持久卷中。进程重启后可以读取最后快照，但会明确标记为 `cached_unconfirmed`/stale，直到收到本次运行中的 MQTT 状态；持久快照不包含 `authTokens` 授权摘要。部署时必须保留 `./data/gateway:/app/data` 挂载。
 
