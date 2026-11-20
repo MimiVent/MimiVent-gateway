@@ -7,6 +7,7 @@ import mqtt from 'mqtt';
 import { certificateFingerprint, createSetupArtifacts, renderSetupPage } from './app_setup.mjs';
 import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
+import { AuthorizationStore } from './auth_store.mjs';
 
 const config = readConfig();
 const setupArtifacts = await createSetupArtifacts({
@@ -88,6 +89,8 @@ const stateSnapshotPrune = database.prepare(`
     SELECT device_id FROM state_snapshots ORDER BY received_at DESC LIMIT 32
   )
 `);
+// P2 单服务授权与手机凭据：存储层由 AuthorizationStore 统一负责（凭据文件 0600）。
+const authorization = new AuthorizationStore(database, config.dataDir);
 let mqttClient;
 let mqttReady = false;
 let mqttTimeReady = false;
@@ -108,6 +111,10 @@ return mqtt.connect(config.mqttUrl, {
 
 const pending = new Map();
 const pendingQueries = new Map();
+// 固件端 query-reply 使用单个待发送槽。不同手机可以并发请求 HTTP，
+// 但同一设备的 MQTT 查询必须在 Gateway 排队，不能同时发布到设备。
+const queryQueues = new Map();
+let queuedQueryCount = 0;
 let observedTimeHealthSequence = null;
 let observedTimeHealthMonotonicAt = 0;
 let observedTimeHealthAgeAtReadMs = 0;
@@ -290,50 +297,27 @@ function restoreStateSnapshots() {
 }
 restoreStateSnapshots();
 
+function appAccess(request, deviceId) {
+  const result = authorization.authenticateApp(request, deviceId);
+  return result.error ? null : result.entry;
+}
+
 function readCachedState(request, deviceId) {
-  const bearer = /^Bearer ([A-Za-z0-9_-]{43})$/.exec(request.headers.authorization ?? '');
-  const tokenId = request.headers['x-device-token-id'];
-  if (!bearer || typeof tokenId !== 'string' || !tokenIdPattern.test(tokenId)) {
-    return {code: 401, body: {error: 'AUTH_REQUIRED'}};
-  }
+  const app = appAccess(request, deviceId);
+  if (!app) return {code: 401, body: {error: 'AUTH_REQUIRED'}};
   const entry = state.get(deviceId);
   if (!entry) return {code: 503, body: {error: 'STATE_UNAVAILABLE'}};
-
   const decodedState = decodeStateSnapshot(entry.value, deviceId);
   if (decodedState.error) return {code: 502, body: {error: decodedState.error}};
   const {state: statePayload, envelope} = decodedState;
-
-  const now = Date.now();
   const ageMs = Math.max(0, performance.now() - entry.receivedMonotonicAt);
   const fresh = !entry.retained && ageMs <= stateFreshnessMs;
-  const expectedHash = tokenHash(bearer[1]);
-  if (fresh && Array.isArray(statePayload.authTokens)) {
-    const active = statePayload.authTokens.find((item) => item && item.tokenId === tokenId);
-    if (!active) {
-      // 已收到设备本次启动的完整绑定快照，缺少该凭据表示绑定已撤销。
-      readGrantDelete.run(deviceId, tokenId);
-      return {code: 403, body: {error: 'READ_GRANT_REVOKED'}};
-    }
-    if (!/^[0-9a-f]{64}$/.test(active.tokenHash ?? '')) {
-      return {code: 502, body: {error: 'STATE_AUTH_INVALID'}};
-    }
-    if (!equalHex(active.tokenHash, expectedHash)) {
-      return {code: 403, body: {error: 'INVALID_BEARER'}};
-    }
-    readGrantPut.run(deviceId, tokenId, expectedHash, now, now + readGrantTtlMs);
-  }
-
-  const grant = readGrantGet.get(deviceId, tokenId);
-  if (!grant || grant.expires_at <= now || !equalHex(grant.token_hash, expectedHash)) {
-    if (grant && grant.expires_at <= now) readGrantDelete.run(deviceId, tokenId);
-    return {code: 403, body: {error: 'READ_GRANT_REQUIRED'}};
-  }
-
   const {authTokens: _authTokens, ...visibleState} = statePayload;
   return {code: 200, body: {
     ...visibleState,
     deviceId,
-    tokenId,
+    appInstanceId: app.app_instance_id,
+    role: app.role,
     bindingState: 'active',
     protocolVersion: 1,
     ...(envelope ? {
@@ -349,29 +333,19 @@ function readCachedState(request, deviceId) {
     stale: !fresh,
   }};
 }
-
 function queryResult(request, deviceId, requestId) {
-  const match = /^Bearer ([A-Za-z0-9_-]{43})$/.exec(request.headers.authorization ?? '');
-  const tokenId = request.headers['x-device-token-id'];
-  if (!match || typeof tokenId !== 'string' || !tokenIdPattern.test(tokenId)) {
-    return {code: 401, body: {error: 'AUTH_REQUIRED'}};
-  }
+  if (!appAccess(request, deviceId)) return {code: 401, body: {error: 'AUTH_REQUIRED'}};
   cleanCompleted();
-  const key = requestKey(deviceId, tokenId, requestId);
+  const key = requestKey(deviceId, '', requestId);
   const cached = completed.get(key);
   const entry = cached ?? pending.get(key);
-  // 查询只接受发起该请求的绑定凭据，缓存不保存明文 token。
-  if (!entry || entry.tokenId !== tokenId || !crypto.timingSafeEqual(
-      Buffer.from(entry.tokenHash, 'hex'), Buffer.from(tokenHash(match[1]), 'hex'))) {
-    return {code: 404, body: {error: 'UNKNOWN'}};
-  }
+  if (!entry) return {code: 404, body: {error: 'UNKNOWN'}};
   return {code: 200, body: {
     requestId,
     status: cached ? (cached.response.httpStatus < 400 ? 'applied' : 'rejected') : 'pending',
     httpStatus: cached ? cached.response.httpStatus : 0,
   }};
 }
-
 function queryPath(value) {
   if (typeof value !== 'string' || value.length > 180 || !value.startsWith('/api/')) {
     return null;
@@ -401,33 +375,69 @@ function queryPath(value) {
 }
 
 function validateQueryAccess(request, deviceId) {
-  const bearer = /^Bearer ([A-Za-z0-9_-]{43})$/.exec(request.headers.authorization ?? '');
-  const tokenId = request.headers['x-device-token-id'];
-  if (!bearer || typeof tokenId !== 'string' || !tokenIdPattern.test(tokenId)) {
-    return {code: 401, error: 'AUTH_REQUIRED'};
-  }
+  if (!appAccess(request, deviceId)) return {code: 401, error: 'AUTH_REQUIRED'};
+  const service = authorization.readServiceCredential(deviceId);
+  if (!service) return {code: 404, error: 'DEVICE_NOT_PROVISIONED'};
   const entry = state.get(deviceId);
   if (!entry || entry.retained ||
       performance.now() - entry.receivedMonotonicAt > stateFreshnessMs) {
     return {code: 503, error: 'DEVICE_STATE_NOT_FRESH'};
   }
-  const decodedState = decodeStateSnapshot(entry.value, deviceId);
-  if (decodedState.error) return {code: 502, error: decodedState.error};
-  const statePayload = decodedState.state;
-  const binding = Array.isArray(statePayload?.authTokens)
-    ? statePayload.authTokens.find((item) => item?.tokenId === tokenId)
-    : null;
-  if (!binding) return {code: 403, error: 'READ_GRANT_REVOKED'};
-  if (!equalHex(binding.tokenHash, tokenHash(bearer[1]))) {
-    return {code: 403, error: 'INVALID_BEARER'};
+  const snapshot = decodeStateSnapshot(entry.value, deviceId);
+  const deviceCredentialId = snapshot.state?.service?.credentialId;
+  if (typeof deviceCredentialId !== 'string') {
+    return {code: 409, error: 'DEVICE_SERVICE_IDENTITY_UNAVAILABLE'};
   }
-  return {code: 200, token: bearer[1], tokenId};
+  if (deviceCredentialId !== service.tokenId) {
+    console.warn(`[gw] service credential mismatch device=${deviceId} gatewayCredentialId=${service.tokenId} deviceCredentialId=${deviceCredentialId}`);
+    return {code: 409, error: 'SERVICE_CREDENTIAL_MISMATCH'};
+  }
+  return {code: 200, token: service.token, tokenId: service.tokenId};
 }
-
 function queryDevice(deviceId, tokenId, token, path) {
   if (!mqttReady || !mqttClient?.connected) {
     return Promise.reject(Object.assign(new Error('MQTT_UNAVAILABLE'), {status: 503}));
   }
+  if (pendingQueries.size + queuedQueryCount >= maxPendingQueries) {
+    return Promise.reject(Object.assign(new Error('GATEWAY_BUSY'), {status: 503}));
+  }
+
+  let queue = queryQueues.get(deviceId);
+  if (!queue) {
+    queue = {tail: Promise.resolve(), waiting: 0, active: 0};
+    queryQueues.set(deviceId, queue);
+  }
+  queue.waiting++;
+  queuedQueryCount++;
+  const queuedAt = performance.now();
+  if (queue.active > 0 || queue.waiting > 1) {
+    console.info(`[gw] query queued device=${deviceId} waiting=${queue.waiting}`);
+  }
+
+  const operation = queue.tail.then(() => {
+    queue.waiting--;
+    queuedQueryCount--;
+    queue.active++;
+    const queueWaitMs = Math.round(performance.now() - queuedAt);
+    if (queueWaitMs > 0) {
+      console.info(`[gw] query start device=${deviceId} queueWaitMs=${queueWaitMs}`);
+    }
+    return publishQueryNow(deviceId, tokenId, token, path);
+  });
+  queue.tail = operation.catch(() => {}).finally(() => {
+    queue.active--;
+    if (queue.active === 0 && queue.waiting === 0 && queryQueues.get(deviceId) === queue) {
+      queryQueues.delete(deviceId);
+    }
+  });
+  return operation;
+}
+
+function publishQueryNow(deviceId, tokenId, token, path) {
+  if (!mqttReady || !mqttClient?.connected) {
+    return Promise.reject(Object.assign(new Error('MQTT_UNAVAILABLE'), {status: 503}));
+  }
+  // 全局上限包含排队请求；此检查作为其它设备并发时的最后一道保护。
   if (pendingQueries.size >= maxPendingQueries) {
     return Promise.reject(Object.assign(new Error('GATEWAY_BUSY'), {status: 503}));
   }
@@ -503,15 +513,9 @@ function readJson(request) {
 }
 
 function validateControl(request, deviceId, body) {
-  const authorization = request.headers.authorization ?? '';
-  const match = /^Bearer ([A-Za-z0-9_-]{43})$/.exec(authorization);
-  const headerTokenId = request.headers['x-device-token-id'];
-  if (!match) throw Object.assign(new Error('AUTH_REQUIRED'), { status: 401 });
-  if (typeof headerTokenId !== 'string' || !tokenIdPattern.test(headerTokenId)) {
-    throw Object.assign(new Error('TOKEN_ID_REQUIRED'), { status: 400 });
-  }
+  if (!appAccess(request, deviceId)) throw Object.assign(new Error('AUTH_REQUIRED'), { status: 401 });
   if (!body || typeof body !== 'object' || Array.isArray(body) ||
-      body.version !== 1 || body.tokenId !== headerTokenId ||
+      body.version !== 1 ||
       typeof body.requestId !== 'string' ||
       !uuidPattern.test(body.requestId ?? '') ||
       !allowedPaths.has(body.path) || typeof body.body !== 'string' ||
@@ -519,19 +523,17 @@ function validateControl(request, deviceId, body) {
       Buffer.byteLength(body.body, 'utf8') > 256) {
     throw Object.assign(new Error('INVALID_CONTROL_REQUEST'), { status: 400 });
   }
-  if (!tokenPattern.test(match[1])) {
-    throw Object.assign(new Error('INVALID_TOKEN'), { status: 401 });
-  }
+  const service = authorization.readServiceCredential(deviceId);
+  if (!service) throw Object.assign(new Error('DEVICE_NOT_PROVISIONED'), { status: 404 });
   return {
     deviceId,
-    tokenId: headerTokenId,
+    tokenId: service.tokenId,
+    token: service.token,
     requestId: body.requestId,
-    token: match[1],
     path: body.path,
     body: body.body,
   };
 }
-
 function cleanCompleted(now = Date.now()) {
   for (const [key, value] of completed) {
     if (now - value.completedAt > completedTtlMs) completed.delete(key);
@@ -954,6 +956,10 @@ const server = https.createServer({
       const path = queryPath(raw?.path);
       if (!path) return writeJson(response, 400, {error: 'QUERY_PATH_NOT_ALLOWED'});
       const result = await queryDevice(readRoute[1], access.tokenId, access.token, path);
+      if (result.statusCode === 401 && result.body?.error === 'BINDING_INVALID') {
+        console.error(`[gw] service credential rejected by device device=${readRoute[1]} credentialId=${access.tokenId}`);
+        return writeJson(response, 409, {error: 'SERVICE_CREDENTIAL_MISMATCH'});
+      }
       return writeJson(response, 200, {
         schemaVersion: 1,
         deviceId: readRoute[1],
@@ -963,6 +969,162 @@ const server = https.createServer({
     } catch (error) {
       const status = Number.isInteger(error.status) ? error.status : 400;
       return writeJson(response, status, {error: error.message ?? 'QUERY_FAILED'});
+    }
+  }
+  // ---- P2 单服务授权：首配会话、手机凭据、邀请 ----
+  if (request.method === 'POST' && url.pathname === '/api/v1/setup/windows' && !url.search) {
+    const window = authorization.openSetupWindow();
+    return writeJson(response, 200, window);
+  }
+  if (request.method === 'POST' && url.pathname === '/api/v1/setup/sessions' && !url.search) {
+    if (!request.headers['content-type']?.toLowerCase().startsWith('application/json')) {
+      return writeJson(response, 415, {error: 'JSON_REQUIRED'});
+    }
+    try {
+      const raw = await readJson(request);
+      const appInstanceId = request.headers['x-app-instance-id'] ?? raw?.appInstanceId;
+      const session = authorization.createSetupSession({
+        setupId: raw?.setupId, setupSecret: raw?.setupSecret, appInstanceId,
+      });
+      if (!session) return writeJson(response, 403, {error: 'SETUP_WINDOW_INVALID_OR_EXPIRED'});
+      return writeJson(response, 200, session);
+    } catch (error) {
+      const status = Number.isInteger(error.status) ? error.status : 400;
+      return writeJson(response, status, {error: error.message ?? 'SETUP_SESSION_FAILED'});
+    }
+  }
+  const setupRoute = /^\/api\/v1\/setup\/sessions\/([0-9a-f-]{36})\/(resume|service|verify|complete|cancel)$/.exec(url.pathname);
+  if (setupRoute && !url.search) {
+    const setupId = setupRoute[1];
+    const action = setupRoute[2];
+    if (!uuidPattern.test(setupId)) return writeJson(response, 400, {error: 'INVALID_SETUP_ID'});
+    if (request.method !== 'POST' || !request.headers['content-type']?.toLowerCase().startsWith('application/json')) {
+      return writeJson(response, 405, {error: 'METHOD_NOT_ALLOWED'});
+    }
+    try {
+      const raw = await readJson(request);
+      const sessionToken = raw?.sessionToken;
+      if (action === 'resume') {
+        const session = authorization.resumeSetupSession({setupId, sessionToken});
+        if (!session) return writeJson(response, 403, {error: 'SETUP_SESSION_INVALID'});
+        return writeJson(response, 200, {
+          stage: session.stage,
+          deviceId: session.device_id,
+          expiresAt: session.expires_at,
+        });
+      }
+      if (action === 'service') {
+        const saved = authorization.saveServiceCredential({
+          setupId, sessionToken, deviceId: raw?.deviceId,
+          tokenId: raw?.credentialId, token: raw?.token,
+        });
+        if (!saved) return writeJson(response, 403, {error: 'SERVICE_CREDENTIAL_REJECTED'});
+        return writeJson(response, 200, {stage: 'pending_device'});
+      }
+      if (action === 'verify') {
+        // 设备在最终确认前保留旧有效凭据；核验新凭据时检查激活候选字段。
+        const session = authorization.getSetupSession(setupId, sessionToken);
+        if (!session || !session.device_id) return writeJson(response, 403, {error: 'SETUP_SESSION_INVALID'});
+        const staged = authorization.readStagedServiceCredential(setupId, session.device_id);
+        if (!staged) return writeJson(response, 409, {error: 'SERVICE_NOT_STAGED'});
+        const snapshot = state.get(session.device_id);
+        if (!snapshot) return writeJson(response, 503, {error: 'DEVICE_NOT_CONNECTED'});
+        const decoded = decodeStateSnapshot(snapshot.value, session.device_id);
+        if (decoded.error) return writeJson(response, 502, {error: decoded.error});
+        const service = decoded.state?.service;
+        const candidateMatches = service?.candidateCredentialId === staged.tokenId &&
+          service?.candidateTransactionId === setupId && service?.candidateState === 'activated';
+        const alreadyCommitted = service?.credentialId === staged.tokenId;
+        if (!candidateMatches && !alreadyCommitted) {
+          return writeJson(response, 409, {error: 'SERVICE_NOT_ACTIVE_ON_DEVICE'});
+        }
+        // 设备激活候选或已完成最终提交并上报 state 后，Gateway 才推进事务阶段。
+        if (session.stage === 'pending_device') {
+          authorization.updateSetupStage({setupId, sessionToken, stage: 'device_committed'});
+        }
+        const updated = authorization.updateSetupStage({setupId, sessionToken, stage: 'verified'});
+        if (!updated) return writeJson(response, 409, {error: 'SETUP_STAGE_CONFLICT'});
+        return writeJson(response, 200, {verified: true, stage: updated.stage, service});
+      }
+      if (action === 'complete') {
+        const credential = authorization.completeSetup({setupId, sessionToken});
+        if (!credential) return writeJson(response, 409, {error: 'SETUP_NOT_VERIFIED'});
+        console.info(`[gw] setup complete setup=${setupId}`);
+        return writeJson(response, 200, {stage: 'completed', ...credential});
+      }
+      const cancelled = authorization.cancelSetup({
+        setupId, sessionToken, devicePendingCancelled: raw?.devicePendingCancelled === true,
+      });
+      if (!cancelled) return writeJson(response, 409, {error: 'SETUP_CANCEL_REJECTED'});
+      return writeJson(response, 200, {stage: cancelled.stage});
+    } catch (error) {
+      const status = Number.isInteger(error.status) ? error.status : 400;
+      return writeJson(response, status, {error: error.message ?? 'SETUP_ACTION_FAILED'});
+    }
+  }
+  const resetRoute = /^\/api\/v1\/devices\/([0-9a-f]{32})\/reset$/.exec(url.pathname);
+  if (resetRoute && request.method === 'POST' && !url.search) {
+    const deviceId = resetRoute[1];
+    const actor = appAccess(request, deviceId);
+    if (!actor) return writeJson(response, 401, {error: 'AUTH_REQUIRED'});
+    const done = authorization.resetDevice(deviceId);
+    if (!done) return writeJson(response, 400, {error: 'RESET_FAILED'});
+    console.info(`[gw] device auth reset device=${deviceId} app=${actor.app_instance_id}`);
+    return writeJson(response, 200, {deviceId, reset: true});
+  }
+  const appsRoute = /^\/api\/v1\/devices\/([0-9a-f]{32})\/apps(?:\/([0-9a-f]{32}))?$/.exec(url.pathname);
+  if (appsRoute && !url.search) {
+    const deviceId = appsRoute[1];
+    const targetApp = appsRoute[2] ?? '';
+    // 管理手机不设唯一管理员角色；所有已加入手机对当前设备拥有相同管理权限。
+    const viewer = appAccess(request, deviceId);
+    if (!viewer) return writeJson(response, 401, {error: 'AUTH_REQUIRED'});
+    if (request.method === 'GET' && !targetApp) {
+      const rows = authorization.listApps(deviceId).map((row) => ({
+        appInstanceId: row.app_instance_id, role: 'control', name: row.name,
+        createdAt: row.created_at, revoked: row.revoked_at != null,
+      }));
+      return writeJson(response, 200, {
+        deviceId,
+        currentAppInstanceId: viewer.app_instance_id,
+        currentRole: 'control',
+        apps: rows,
+      });
+    }
+    if (request.method === 'DELETE' && targetApp) {
+      if (targetApp === viewer.app_instance_id) {
+        return writeJson(response, 409, {error: 'CANNOT_REVOKE_SELF'});
+      }
+      const revoked = authorization.revokeApp({deviceId, appInstanceId: targetApp});
+      if (!revoked) return writeJson(response, 404, {error: 'APP_NOT_FOUND'});
+      return writeJson(response, 200, {deviceId, appInstanceId: targetApp, revoked: true});
+    }
+    if (request.method === 'POST' && !targetApp) {
+      const invite = authorization.createInvite({
+        deviceId, createdByAppInstanceId: viewer.app_instance_id,
+        expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+      });
+      if (!invite) return writeJson(response, 409, {error: 'INVITE_FAILED'});
+      return writeJson(response, 200, {deviceId, ...invite});
+    }
+    return writeJson(response, 405, {error: 'METHOD_NOT_ALLOWED'});
+  }
+  if (request.method === 'POST' && url.pathname === '/api/v1/invites/redeem' && !url.search) {
+    if (!request.headers['content-type']?.toLowerCase().startsWith('application/json')) {
+      return writeJson(response, 415, {error: 'JSON_REQUIRED'});
+    }
+    try {
+      const raw = await readJson(request);
+      const issued = authorization.redeemInvite({
+        inviteCode: raw?.inviteCode,
+        appInstanceId: request.headers['x-app-instance-id'] ?? raw?.appInstanceId,
+        name: raw?.name,
+      });
+      if (!issued) return writeJson(response, 403, {error: 'INVITE_INVALID_OR_EXPIRED'});
+      return writeJson(response, 200, issued);
+    } catch (error) {
+      const status = Number.isInteger(error.status) ? error.status : 400;
+      return writeJson(response, status, {error: error.message ?? 'INVITE_REDEEM_FAILED'});
     }
   }
   const route = /^\/api\/v1\/devices\/([0-9a-f]{32})\/control$/.exec(url.pathname);

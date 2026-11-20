@@ -9,21 +9,33 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import https from 'node:https';
 import net from 'node:net';
-import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import mqtt from 'mqtt';
+import { AuthorizationStore } from '../auth_store.mjs';
 
 const exec = promisify(execFile);
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const deviceId = 'a'.repeat(32);
-const tokenId = 'b'.repeat(32);
-const token = 'c'.repeat(43);
+// 设备服务凭据：Gateway 保存明文供 MQTT 使用，设备只保存摘要。
+const credentialId = 'b'.repeat(32);
+const serviceToken = 'c'.repeat(43);
+// 手机访问凭据：由 Gateway 签发，手机持有，不接触设备服务 token。
+const phoneId = 'f'.repeat(32);
+let phoneToken = '';
+const secondPhoneId = '9'.repeat(32);
+let secondPhoneToken = '';
 const container = `mimivent-query-test-${Date.now()}`;
 const messages = new Map();
 const readQueries = new Map();
 const queryReplies = new Map();
 const timeReplies = new Map();
 let timeHealthSequence = 1;
+let serializeQueryTest = false;
+let activeDeviceQuery = false;
+let activeDeviceQueryId = null;
+let firstBlockedQuerySeenResolve;
+let firstBlockedQueryRelease;
+let firstBlockedQuerySeen = Promise.resolve();
 let directory, gateway, device, port, containerStarted = false, gatewayEnv;
 let mode = 'normal';
 let logs = '';
@@ -37,8 +49,8 @@ function request(method, path, body, headers = {}) {
       rejectUnauthorized: false,
       headers: {
         'content-type': 'application/json',
-        authorization: `Bearer ${token}`,
-        'x-device-token-id': tokenId,
+        authorization: `Bearer ${phoneToken}`,
+        'x-app-instance-id': phoneId,
         ...headers,
       },
     }, (res) => {
@@ -103,13 +115,55 @@ before(async () => {
   await new Promise((done) => listener.listen(0, '127.0.0.1', done));
   port = listener.address().port;
   await new Promise((done) => listener.close(done));
-  gatewayEnv = { ...process.env, PORT: String(port), MQTT_URL: `mqtt://127.0.0.1:${brokerPort}`,
+  gatewayEnv = { ...process.env, PORT: String(port), NAS_IP: '127.0.0.1', MQTT_URL: `mqtt://127.0.0.1:${brokerPort}`,
       MQTT_USERNAME: 'test', MQTT_PASSWORD: 'test-password',
       TLS_CERT_FILE: join(directory, 'cert.pem'), TLS_KEY_FILE: join(directory, 'key.pem'),
       GATEWAY_DATA_DIR: directory,
       TIME_SYNC_HEALTH_FILE: join(directory, 'time-health.json') };
   gateway = startGateway();
   await waitForGateway();
+  // 用生产授权存储 API 建立服务凭据和首个普通手机凭据。
+  {
+    const seed = new DatabaseSync(join(directory, 'gateway.sqlite'));
+    const authorization = new AuthorizationStore(seed, directory);
+    const setupWindow = authorization.openSetupWindow();
+    const session = authorization.createSetupSession({
+      setupId: setupWindow.setupId,
+      setupSecret: setupWindow.setupSecret,
+      appInstanceId: phoneId,
+    });
+    assert.ok(session);
+    assert.equal(authorization.saveServiceCredential({
+      setupId: session.setupId,
+      sessionToken: session.sessionToken,
+      deviceId,
+      tokenId: credentialId,
+      token: serviceToken,
+    }), true);
+    assert.ok(authorization.updateSetupStage({
+      setupId: session.setupId,
+      sessionToken: session.sessionToken,
+      stage: 'device_committed',
+    }));
+    assert.ok(authorization.updateSetupStage({
+      setupId: session.setupId,
+      sessionToken: session.sessionToken,
+      stage: 'verified',
+    }));
+    phoneToken = authorization.completeSetup({
+      setupId: session.setupId,
+      sessionToken: session.sessionToken,
+    })?.appToken;
+    assert.ok(phoneToken);
+    const secondPhone = authorization.issueAppCredential({
+      appInstanceId: secondPhoneId,
+      deviceId,
+      name: '集成测试手机 B',
+    });
+    secondPhoneToken = secondPhone?.appToken ?? '';
+    assert.ok(secondPhoneToken);
+    seed.close();
+  }
   device = mqtt.connect(`mqtt://127.0.0.1:${brokerPort}`, { reconnectPeriod: 0 });
   await new Promise((done, reject) => {
     device.on('error', reject);
@@ -120,7 +174,7 @@ before(async () => {
     ],
       { qos: 1 }, (error) => error ? reject(error) : done()));
   });
-  device.on('message', (messageTopic, bytes) => {
+  device.on('message', async (messageTopic, bytes) => {
     if (messageTopic.endsWith('/time-reply')) {
       const reply = JSON.parse(bytes);
       timeReplies.set(reply.nonce, reply);
@@ -136,11 +190,14 @@ before(async () => {
           device.publish(`mimivent/v1/${deviceId}/query-reply`, JSON.stringify({
             schemaVersion: 1,
             queryId: ack.queryId,
-            statusCode: 200,
+            statusCode: response.statusCode,
             chunkIndex,
             chunkCount: response.chunks.length,
             data: response.chunks[chunkIndex],
           }), {qos: 1});
+        } else if (response.ownsDeviceSlot && activeDeviceQueryId === ack.queryId) {
+          activeDeviceQuery = false;
+          activeDeviceQueryId = null;
         }
       }
       return;
@@ -148,6 +205,33 @@ before(async () => {
     const command = JSON.parse(bytes);
     if (messageTopic.endsWith('/query')) {
       readQueries.set(command.queryId, (readQueries.get(command.queryId) ?? 0) + 1);
+      if (serializeQueryTest && activeDeviceQuery) {
+        const busyBody = Buffer.from(JSON.stringify({error: 'QUERY_BUSY'}));
+        const response = {
+          chunks: [busyBody.toString('utf8')],
+          nextIndex: 0,
+          statusCode: 429,
+          ownsDeviceSlot: false,
+        };
+        queryReplies.set(command.queryId, response);
+        device.publish(`mimivent/v1/${deviceId}/query-reply`, JSON.stringify({
+          schemaVersion: 1,
+          queryId: command.queryId,
+          statusCode: response.statusCode,
+          chunkIndex: 0,
+          chunkCount: 1,
+          data: response.chunks[0],
+        }), {qos: 1});
+        return;
+      }
+      if (serializeQueryTest) {
+        activeDeviceQuery = true;
+        activeDeviceQueryId = command.queryId;
+        if (readQueries.size === 1) {
+          firstBlockedQuerySeenResolve?.();
+          await new Promise((resolve) => { firstBlockedQueryRelease = resolve; });
+        }
+      }
       const body = JSON.stringify({
         deviceId: '0123456789abcdef',
         path: command.path,
@@ -162,7 +246,12 @@ before(async () => {
         chunks.push(bytes.subarray(start, end).toString('utf8'));
         start = end;
       }
-      queryReplies.set(command.queryId, {chunks, nextIndex: 0});
+      queryReplies.set(command.queryId, {
+        chunks,
+        nextIndex: 0,
+        statusCode: 200,
+        ownsDeviceSlot: serializeQueryTest,
+      });
       device.publish(`mimivent/v1/${deviceId}/query-reply`, JSON.stringify({
         schemaVersion: 1,
         queryId: command.queryId,
@@ -199,62 +288,91 @@ after(async () => {
 const controlPath = `/api/v1/devices/${deviceId}/control`;
 const deviceReadPath = `/api/v1/devices/${deviceId}/query`;
 const statePath = `/api/v1/devices/${deviceId}/state`;
+const appsPath = `/api/v1/devices/${deviceId}/apps`;
 const queryPath = (id) => `/api/v1/devices/${deviceId}/requests/${id}`;
-const controlBody = (id) => ({ version: 1, requestId: id, tokenId,
+const controlBody = (id) => ({ version: 1, requestId: id,
   path: '/api/timed', body: 'mode=on' });
 
 let stateSampledUptimeMs = 1234;
 function publishSnapshot({
-  authTokens = [{ tokenId, tokenHash: createHash('sha256').update(token).digest('hex') }],
   retain = false,
   bootId = 'f'.repeat(16),
   seq = 42,
   sampledUptimeMs = ++stateSampledUptimeMs,
   mode = 'auto',
+  serviceCredentialId = credentialId,
+  serviceCandidateCredentialId,
+  serviceCandidateTransactionId,
+  serviceCandidateState,
 } = {}) {
   return new Promise((resolve, reject) => device.publish(`mimivent/v1/${deviceId}/state`,
     JSON.stringify({ schemaVersion: 1, deviceId, bootId, seq, sampledUptimeMs,
-      state: { fan: false, mode, authTokens } }),
+      state: { fan: false, mode, service: {
+        credentialId: serviceCredentialId,
+        ...(serviceCandidateCredentialId ? {candidateCredentialId: serviceCandidateCredentialId} : {}),
+        ...(serviceCandidateTransactionId ? {candidateTransactionId: serviceCandidateTransactionId} : {}),
+        ...(serviceCandidateState ? {candidateState: serviceCandidateState} : {}),
+      } } }),
     { qos: 1, retain }, (error) => error ? reject(error) : resolve()));
 }
 
-function publishState(authTokens = [{ tokenId, tokenHash: createHash('sha256').update(token).digest('hex') }], retain = true) {
-  return publishSnapshot({ authTokens, retain });
+test('保留旧服务期间 Gateway 可核验已激活候选授权', async () => {
+  const opened = await request('POST', '/api/v1/setup/windows', {});
+  assert.equal(opened.code, 200);
+  const session = await request('POST', '/api/v1/setup/sessions', {
+    setupId: opened.body.setupId,
+    setupSecret: opened.body.setupSecret,
+  }, {'x-app-instance-id': phoneId});
+  assert.equal(session.code, 200);
+  const nextCredential = 'e'.repeat(32);
+  const nextServiceToken = 'n'.repeat(43);
+  const staged = await request('POST', `/api/v1/setup/sessions/${opened.body.setupId}/service`, {
+    sessionToken: session.body.sessionToken,
+    deviceId,
+    credentialId: nextCredential,
+    token: nextServiceToken,
+  });
+  assert.equal(staged.code, 200);
+  assert.equal(staged.body.stage, 'pending_device');
+  await publishSnapshot({retain: false,
+    serviceCandidateCredentialId: nextCredential,
+    serviceCandidateTransactionId: opened.body.setupId,
+    serviceCandidateState: 'activated'});
+  await delay(100);
+  const verified = await request('POST', `/api/v1/setup/sessions/${opened.body.setupId}/verify`, {
+    sessionToken: session.body.sessionToken,
+  });
+  assert.equal(verified.code, 200, JSON.stringify(verified.body));
+  assert.equal(verified.body.verified, true);
+});
+
+function publishState(_legacyAuthTokens, retain = true) {
+  return publishSnapshot({retain});
 }
 
-test('状态读取校验 token 哈希，返回不泄漏授权摘要，并持久化 7 天 read grant', async () => {
+test('状态读取使用手机凭据鉴权，返回不泄漏授权摘要', async () => {
   await publishState();
   await delay(100);
-  const wrongTokenId = 'e'.repeat(32);
   const denied = await request('GET', statePath, null,
-    { 'x-device-token-id': wrongTokenId });
-  assert.equal(denied.code, 403);
-  assert.equal(denied.body.error, 'READ_GRANT_REVOKED');
+    { authorization: `Bearer ${'d'.repeat(43)}` });
+  assert.equal(denied.code, 401);
+  assert.equal(denied.body.error, 'AUTH_REQUIRED');
+  const wrongPhone = await request('GET', statePath, null,
+    { 'x-app-instance-id': 'e'.repeat(32) });
+  assert.equal(wrongPhone.code, 401);
 
   const response = await request('GET', statePath);
   assert.equal(response.code, 200);
   assert.equal(response.body.deviceId, deviceId);
-  assert.equal(response.body.tokenId, tokenId);
+  assert.equal(response.body.appInstanceId, phoneId);
   assert.equal(response.body.bindingState, 'active');
   assert.equal(response.body.authTokens, undefined);
   assert.equal(response.body.bootId, 'f'.repeat(16));
   assert.equal(response.body.seq, 42);
   assert.equal(response.body.fan, false);
   assert.equal(response.body.stateFreshness, 'fresh');
-
-  const badBearer = await request('GET', statePath, null,
-    { authorization: `Bearer ${'d'.repeat(43)}` });
-  assert.equal(badBearer.code, 403);
-  assert.equal(badBearer.body.error, 'INVALID_BEARER');
   const stillAuthorized = await request('GET', statePath);
   assert.equal(stillAuthorized.code, 200);
-
-  const db = new DatabaseSync(join(directory, 'gateway.sqlite'));
-  const grant = db.prepare('SELECT token_hash, expires_at FROM read_grants WHERE device_id = ? AND token_id = ?')
-    .get(deviceId, tokenId);
-  assert.equal(grant.token_hash, createHash('sha256').update(token).digest('hex'));
-  assert.ok(grant.expires_at > Date.now() + 6 * 24 * 60 * 60 * 1000);
-  db.close();
 });
 
 test('状态序号按模 2^32 拒绝旧包并接受回绕后的新包', async () => {
@@ -296,6 +414,89 @@ test('统计/事件只读请求经 MQTT query-reply 往返，不暴露 bearer �
   assert.equal(readQueries.size, 1);
 });
 
+test('设备上报的服务凭据与 Gateway 不一致时在 MQTT 查询前明确拒绝', async () => {
+  await publishSnapshot({retain: false, serviceCredentialId: 'd'.repeat(32)});
+  await delay(100);
+  readQueries.clear();
+  const response = await request('POST', deviceReadPath,
+    {path: '/api/stats?mode=today&limit=4'});
+  assert.equal(response.code, 409);
+  assert.equal(response.body.error, 'SERVICE_CREDENTIAL_MISMATCH');
+  assert.equal(readQueries.size, 0);
+});
+
+test('同一设备的并发手机查询由 Gateway 串行化，避免固件单查询槽冲突', async () => {
+  await publishState(undefined, false);
+  await delay(100);
+  readQueries.clear();
+  serializeQueryTest = true;
+  activeDeviceQuery = false;
+  activeDeviceQueryId = null;
+  firstBlockedQuerySeen = new Promise((resolve) => {
+    firstBlockedQuerySeenResolve = resolve;
+  });
+
+  const path = '/api/stats?mode=today&limit=4';
+  const firstRequest = request('POST', deviceReadPath, {path});
+  const safetyTimer = setTimeout(() => firstBlockedQueryRelease?.(), 5000);
+  try {
+    await Promise.race([
+      firstBlockedQuerySeen,
+      delay(2000).then(() => { throw new Error('第一条查询未到达模拟设备'); }),
+    ]);
+    const secondRequest = request('POST', deviceReadPath, {path}, {
+      authorization: `Bearer ${secondPhoneToken}`,
+      'x-app-instance-id': secondPhoneId,
+    });
+    await delay(100);
+    assert.equal(readQueries.size, 1,
+      '第二条查询应留在 Gateway 队列，不能与第一条同时到达单槽固件');
+
+    firstBlockedQueryRelease?.();
+    const [first, second] = await Promise.all([firstRequest, secondRequest]);
+    assert.equal(first.code, 200);
+    assert.equal(first.body.statusCode, 200);
+    assert.equal(second.code, 200);
+    assert.equal(second.body.statusCode, 200);
+    assert.equal(readQueries.size, 2);
+  } finally {
+    clearTimeout(safetyTimer);
+    firstBlockedQueryRelease?.();
+    serializeQueryTest = false;
+    activeDeviceQuery = false;
+    activeDeviceQueryId = null;
+    firstBlockedQuerySeenResolve = null;
+    firstBlockedQueryRelease = null;
+  }
+});
+
+test('所有已加入手机都能生成邀请并管理手机凭据', async () => {
+  const memberList = await request('GET', appsPath);
+  assert.equal(memberList.code, 200);
+  assert.equal(memberList.body.currentAppInstanceId, phoneId);
+  assert.equal(memberList.body.currentRole, 'control');
+  assert.equal(memberList.body.apps.length, 2);
+  assert.ok(memberList.body.apps.every((app) => app.role === 'control'));
+  assert.ok(memberList.body.apps.every((app) => app.appToken === undefined));
+
+  const controlHeaders = {
+    authorization: `Bearer ${secondPhoneToken}`,
+    'x-app-instance-id': secondPhoneId,
+  };
+  const controlList = await request('GET', appsPath, null, controlHeaders);
+  assert.equal(controlList.code, 200);
+  assert.equal(controlList.body.currentRole, 'control');
+  const invite = await request('POST', appsPath, {}, controlHeaders);
+  assert.equal(invite.code, 200);
+  assert.equal(typeof invite.body.inviteCode, 'string');
+
+  const revoked = await request('DELETE', `${appsPath}/${phoneId}`, null, controlHeaders);
+  assert.equal(revoked.code, 200);
+  assert.equal(revoked.body.revoked, true);
+  const denied = await request('GET', statePath);
+  assert.equal(denied.code, 401);
+});
+
 test('NAS 只在时间健康文件新鲜且已同步时响应 MQTT 校时', async () => {
   const nonce = 'd'.repeat(32);
   const sentAt = Date.now();
@@ -333,12 +534,19 @@ test('NAS 只在时间健康文件新鲜且已同步时响应 MQTT 校时', asyn
   assert.equal(timeReplies.get(unavailableNonce)?.reason, 'host_clock_unsynchronized');
 });
 
-test('设备在线确认绑定撤销后删除旧 read grant', async () => {
-  await publishState([]);
-  await delay(100);
+test('撤销手机凭据后立即失去读取权限', async () => {
+  const revoke = new DatabaseSync(join(directory, 'gateway.sqlite'));
+  revoke.prepare('UPDATE app_credentials SET revoked_at = ? WHERE device_id = ? AND app_instance_id = ?')
+    .run(Date.now(), deviceId, phoneId);
+  revoke.close();
   const response = await request('GET', statePath);
-  assert.equal(response.code, 403);
-  assert.equal(response.body.error, 'READ_GRANT_REVOKED');
+  assert.equal(response.code, 401);
+  assert.equal(response.body.error, 'AUTH_REQUIRED');
+  // 恢复凭据，避免影响后续用例。
+  const restore = new DatabaseSync(join(directory, 'gateway.sqlite'));
+  restore.prepare('UPDATE app_credentials SET revoked_at = NULL WHERE device_id = ? AND app_instance_id = ?')
+    .run(deviceId, phoneId);
+  restore.close();
 });
 
 test('并发去重后的成功结果可查询，查询不会重新发送控制', async () => {
@@ -365,15 +573,16 @@ test('设置更新仍经过 NAS MQTT 两阶段控制通道', async () => {
   assert.deepEqual(messages.get(id), ['prepare', 'execute']);
 });
 
-test('查询拒绝其他 bearer、其他 tokenId 和未知请求', async () => {
+test('查询拒绝无效手机凭据和未知请求', async () => {
   const id = randomUUID();
   await request('POST', controlPath, controlBody(id));
   assert.equal((await request('GET', queryPath(id), null,
-    { authorization: `Bearer ${'x'.repeat(43)}` })).code, 404);
+    { authorization: `Bearer ${'x'.repeat(43)}` })).code, 401);
   assert.equal((await request('GET', queryPath(id), null,
-    { 'x-device-token-id': 'e'.repeat(32) })).code, 404);
+    { 'x-app-instance-id': 'e'.repeat(32) })).code, 401);
   assert.equal((await request('GET', queryPath(id), null, { authorization: '' })).code, 401);
   assert.equal((await request('GET', queryPath(randomUUID()))).code, 404);
+  assert.equal((await request('GET', queryPath(id))).code, 200);
   assert.deepEqual(messages.get(id), ['prepare', 'execute']);
 });
 
@@ -481,6 +690,11 @@ test('Gateway 重启后从 SQLite 恢复最后状态，并将其标记为过期�
 
   const db = new DatabaseSync(join(directory, 'gateway.sqlite'));
   assert.equal(db.prepare('PRAGMA user_version').get().user_version, 1);
+  // 授权表由 AuthorizationStore 初始化；Gateway 自有表由 user_version=1 管理。
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((row) => row.name);
+  assert.ok(tables.includes('service_credentials'));
+  assert.ok(tables.includes('app_credentials'));
+  assert.ok(tables.includes('setup_sessions'));
   const snapshot = db.prepare('SELECT payload FROM state_snapshots WHERE device_id = ?')
     .get(deviceId);
   assert.ok(snapshot);

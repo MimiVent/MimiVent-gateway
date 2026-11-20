@@ -15,7 +15,7 @@ services:
       - mimivent
 
   gateway:
-    image: mimivent-gateway:0.1.0
+    image: mimivent-gateway:0.2.0
     build:
       context: .
     container_name: mimivent-gateway
@@ -43,6 +43,7 @@ services:
       - ./tls:/run/tls:ro
       # NAS 使用已导入镜像时直接挂载受版本控制的网关源码，避免运行旧镜像内的 server.mjs。
       - ./server.mjs:/app/server.mjs:ro
+      - ./auth_store.mjs:/app/auth_store.mjs:ro
       - ./data/gateway:/app/data
       # NAS 主机侧健康提供器原子更新该文件；无文件/陈旧文件时校时安全失败关闭。
       - ${HOST_TIME_SYNC_HEALTH_DIR:-./data/time-health}:/run/mimivent:ro

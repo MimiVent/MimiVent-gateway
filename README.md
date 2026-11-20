@@ -1,10 +1,10 @@
 # MimiVent NAS 网关
 
-当前首个公开发布版本：Gateway `v0.1.0`，配套 App `v0.7.0+11`、固件 `v0.7.0`。变更见 [CHANGELOG.md](CHANGELOG.md)。
+本次拟发布版本：Gateway `v0.2.0`，配套 App `v0.7.1+12`、NAS 固件 `v0.7.1`。版本从上次正式 Gateway `v0.1.0` 递增，不沿用开发测试状态。Remote TLS 尚未实现；本 Gateway 仅供可信家庭局域网部署。变更见 [CHANGELOG.md](CHANGELOG.md)。
 
-局域网内的 HTTPS 控制 API 与 Mosquitto MQTT Broker。网关通过 App 绑定 token 转发请求；设备仍验证 token，并执行去重与控制租约检查。
+局域网内的 HTTPS 控制 API 与 Mosquitto MQTT Broker。设备只保存一个 NAS 服务凭据；Gateway 保存该凭据并代理 MQTT 控制。每部手机使用 Gateway 单独签发的访问凭据，由 Gateway 管理成员权限；设备继续验证服务凭据、请求去重和控制租约。
 
-本版本必须搭配 MQTT 控制消息 v2 固件。网关先做不执行控制的预检，获取设备签发的短时凭据后再提交控制。设备使用自身计时拒绝过期请求，不依赖联网校时。App 对结果未知的控制保留原请求，后续点击只查询；核对设备实际状态后，可通过页面上的“结束上次结果确认”解除等待。
+本版本必须搭配 NAS 固件 `v0.7.1` 和 App `v0.7.1+12`。首次配置由 App 经 BLE 为设备建立服务凭据，再由 Gateway 核验设备状态并签发手机访问凭据。控制仍使用设备预检与执行两阶段协议；设备使用自身计时拒绝过期请求，不依赖联网校时。App 对结果未知的控制保留原请求，后续点击只查询；核对设备实际状态后，可在 App 中结束上次结果确认。
 
 ## NAS Docker 部署
 
@@ -174,10 +174,10 @@ python3 time_health_provider.py data/time-health/time-health.json --watch --inte
 
 ## 安全边界
 
-- App 到 NAS Gateway 的 HTTPS 使用 Gateway 固定证书指纹校验；设备 bearer token 只经此 HTTPS 交给 NAS 网关，再通过家庭局域网 MQTT 传给设备。Broker 账号凭据保存在 NAS `.env` 与设备 NVS，不写在源码中。
+- App 到 NAS Gateway 的 HTTPS 使用固定证书指纹校验；App 使用 Gateway 签发的手机凭据访问 API。设备服务 token 只保存在 Gateway 与设备侧，通过家庭局域网 MQTT 完成服务鉴权；Broker 账号凭据保存在 NAS `.env` 与设备 NVS，不写在源码中，也不下发给 App。
 - Mosquitto ACL 只允许 `mimivent` 用户访问 MimiVent v1 topic。当前固件使用相同 Broker 凭据收发主题，所以此单设备/单家庭阶段的 ACL 范围是 `mimivent/v1/#`。Broker 只绑定家庭 LAN，不要暴露到公网。
 - NAS 或 Broker 停机时，App 明确提示网关不可用并允许用户切换蓝牙；设备 HTTPS 控制已关闭，不执行直连回退。等待设备 ACK 超时则保留原 requestId，App 查询原结果，不自动重发。
-- Broker 用户认证与 ACL 不能替代设备 token 校验。设备控制仍以固件绑定表中的 token hash 为准。
+- Broker 用户认证与 ACL 不能替代设备服务授权校验。每设备一份服务授权；手机成员授权由 Gateway 单独验证和撤销。
 
 ### Docker 仓库不可达时：跨架构镜像传入 NAS
 
@@ -186,15 +186,15 @@ python3 time_health_provider.py data/time-health/time-health.json --watch --inte
 在可拉取 Node 基础镜像的电脑上：
 
 ```sh
-docker buildx build --platform linux/amd64 --load -t mimivent-gateway:0.1.0 .
-docker save -o /tmp/mimivent-gateway-0.1.0-linux-amd64.tar mimivent-gateway:0.1.0
-scp /tmp/mimivent-gateway-0.1.0-linux-amd64.tar admin@NAS_IP:/tmp/
+docker buildx build --platform linux/amd64 --load -t mimivent-gateway:0.2.0 .
+docker save -o /tmp/mimivent-gateway-0.2.0-linux-amd64.tar mimivent-gateway:0.2.0
+scp /tmp/mimivent-gateway-0.2.0-linux-amd64.tar admin@NAS_IP:/tmp/
 ```
 
 再在 NAS 上：
 
 ```sh
-sudo docker load -i /tmp/mimivent-gateway-0.1.0-linux-amd64.tar
+sudo docker load -i /tmp/mimivent-gateway-0.2.0-linux-amd64.tar
 cd /vol1/1000/docker/mimivent
 sudo docker compose -f compose.yaml up -d gateway
 sudo docker compose -f compose.yaml ps
@@ -204,7 +204,7 @@ sudo docker compose -f compose.yaml ps
 
 ## 运维
 
-App 可通过 `GET /api/v1/devices/{deviceId}/requests/{requestId}` 查询网关缓存的 `pending/applied/rejected`。必须使用发起该请求的原始 bearer token 和 `X-Device-Token-Id`，其他绑定不能查询。接口只读取结果，不发布 MQTT 命令；缓存默认保留 10 分钟，网关重启后或没有记录时返回 404，App 再查设备持久化记录。
+App 可通过 `GET /api/v1/devices/{deviceId}/requests/{requestId}` 查询网关缓存的 `pending/applied/rejected`。必须使用发起该请求手机的原始 bearer 凭据和 `X-Phone-Id`；其他手机不能查询该手机的请求。接口只读取结果，不发布 MQTT 命令；缓存默认保留 10 分钟，网关重启后或没有记录时返回 404，App 再查设备持久化记录。
 
 最新设备状态保存在 Gateway 的 SQLite 持久卷中。进程重启后可以读取最后快照，但会明确标记为 `cached_unconfirmed`/stale，直到收到本次运行中的 MQTT 状态；持久快照不包含 `authTokens` 授权摘要。部署时必须保留 `./data/gateway:/app/data` 挂载。
 
